@@ -1,0 +1,110 @@
+(ns clj-parasoup.http-proxy.core
+  (:import [org.jboss.netty.buffer ChannelBuffer])
+  (:require [co.paralleluniverse.pulsar.core :as pc]
+            [clojure.string :as string]
+            [org.httpkit.client :as http]
+            [clojure.tools.logging :as log]
+            [clj-parasoup.util.map :as umap]))
+
+(defn text-domain->soup [domain text]
+  (string/replace text domain "soup.io"))
+
+(defn text-soup->domain [domain text]
+  (string/replace text "soup.io" domain))
+
+(defn text-https->http [text] (string/replace text "https://" "http://"))
+(defn text-http->https[text] (string/replace text "http://" "https://"))
+
+(defn header-domain->soup
+  ([domain header] (header-domain->soup domain header false))
+  ([domain header usehttps]
+   (let [newheader (umap/map-over-map-values header (partial text-domain->soup domain))]
+     (if usehttps
+       (umap/map-over-map-values newheader text-http->https)
+       newheader))))
+
+(defn header-soup->domain [domain header]
+  (umap/map-over-map-values header (partial text-soup->domain domain)))
+
+(def method->client-map {:get http/get
+                         :post http/post
+                         :head http/head})
+
+(defn request->scheme [request]
+  (cond
+    (= "/login" (:uri request)) "https://"
+    :else "http://"))
+
+(defn run-request-in-thread [opts clbk]
+  (future
+    (http/request
+     (reduce (fn [acc [k v]] (if (nil? v) (dissoc acc k) acc))
+             opts
+             opts)
+     (fn [result]
+       (log/debug "got result")
+       (clbk result)))))
+
+(pc/defsfn wrap-request [opts]
+  (log/debug "wrap request")
+  (pc/join (pc/spawn-fiber #(pc/await run-request-in-thread opts))))
+
+(defn postprocess-soup-headers [response domain]
+  (-> (:headers response)
+      (umap/map-over-map-values (fn [v] (if (coll? v)
+                                          (map (partial string/lower-case) v)
+                                          (string/lower-case v))))
+      (umap/map-over-map-values (fn [v] (let [transf (fn [t] (->> t
+                                                                  (text-soup->domain domain)
+                                                                  (text-https->http)))]
+                                          (if (coll? v)
+                                            (map transf v)
+                                            (transf v)))))
+      (umap/map-over-map-keys (fn [k] (string/lower-case (if (keyword? k) (name k) k))))
+      (dissoc "server" "status" "connection" "content-encoding" "date" "content-length")))
+
+(defn postprocess-soup-response [response domain]
+  (assoc response :headers (postprocess-soup-headers response domain)
+                  :body (if (string? (:body response))
+                          (->> (:body response)
+                               (text-soup->domain domain)
+                               (text-https->http))
+                          (:body response))))
+
+(defn format-url [request headers scheme]
+  (format "%s%s%s%s"
+          scheme
+          (get headers "host")
+          (:uri request)
+          (if (:query-string request)
+            (str "?" (:query-string request))
+            "")))
+
+(defn generate-request-headers [headers domain scheme]
+  (dissoc
+   (header-domain->soup domain headers (= "https://" scheme))
+   "host" "content-length" "accept-encoding"))
+
+(defn wrap-body [body]
+  (if (instance? ChannelBuffer body)
+    (.toByteBuffer body)
+    body))
+
+(pc/defsfn relay [request domain]
+  (let [scheme (request->scheme request)
+         headers (umap/map-over-map-keys (:headers request) string/lower-case)
+         newtarget (text-domain->soup domain (format-url request headers scheme))
+         opts {:url newtarget
+               :method (:request-method request)
+               :headers (generate-request-headers headers domain scheme)
+               :as (when (re-find #"(?i)(\.gif|\.png|\.jpg|\.jpeg)$" (:uri request))
+                     :byte-array)
+               :body (wrap-body (:body request))
+               :follow-redirects false
+               :timeout 10000}]
+        (let [response (wrap-request opts)
+              processed-response (postprocess-soup-response response domain)]
+          (reduce
+           #(assoc %1 %2 (get processed-response %2))
+           {}
+           [:status :headers :body]))))
