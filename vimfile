@@ -1,2 +1,4 @@
 This is a text file written in vim.
+I'm on branch master.
 I'm on branch vim, I said.
+>>>>>>> origin/maste
